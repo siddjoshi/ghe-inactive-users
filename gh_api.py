@@ -1,5 +1,6 @@
 """GitHub Enterprise Cloud API client with rate-limit handling and pagination."""
 
+import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,26 @@ DEFAULT_PER_PAGE = 100
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 1  # seconds
 
+MEMBERS_QUERY = """
+query($slug: String!, $cursor: String) {
+  enterprise(slug: $slug) {
+    members(first: 100, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        ... on EnterpriseUserAccount {
+          login
+          name
+        }
+        ... on User {
+          login
+          name
+        }
+      }
+    }
+  }
+}
+"""
+
 
 class GitHubAPIError(Exception):
     """Raised when the GitHub API returns an error."""
@@ -24,7 +45,7 @@ class GitHubAPIError(Exception):
 
 
 class GitHubClient:
-    """Authenticated GitHub REST API client with retry and pagination."""
+    """Authenticated GitHub REST/GraphQL API client with retry and pagination."""
 
     def __init__(self, token: str, base_url: str = "https://api.github.com"):
         self.base_url = base_url.rstrip("/")
@@ -85,24 +106,41 @@ class GitHubClient:
 
         raise GitHubAPIError(resp.status_code, f"Max retries exceeded. Last: {resp.text}")
 
+    def _graphql(self, query: str, variables: Optional[dict] = None) -> dict:
+        """Execute a GraphQL query with retry logic."""
+        url = f"{self.base_url}/graphql"
+        payload = {"query": query}
+        if variables:
+            payload["variables"] = variables
+
+        resp = self._request("POST", url, json=payload)
+        result = resp.json()
+
+        if "errors" in result:
+            error_msgs = "; ".join(e.get("message", str(e)) for e in result["errors"])
+            raise GitHubAPIError(resp.status_code, f"GraphQL errors: {error_msgs}")
+
+        return result["data"]
+
     def get_enterprise_members(self, enterprise: str) -> list[dict]:
-        """Fetch all members of a GitHub Enterprise (EMU) via REST API.
+        """Fetch all members of a GitHub Enterprise (EMU) via GraphQL API.
 
         Returns a list of dicts with at least 'login' key per member.
         """
         members = []
-        url = f"{self.base_url}/enterprises/{enterprise}/members"
-        params = {"per_page": DEFAULT_PER_PAGE}
+        cursor = None
 
-        while url:
-            resp = self._request("GET", url, params=params)
-            data = resp.json()
-            members.extend(data)
+        while True:
+            data = self._graphql(MEMBERS_QUERY, {"slug": enterprise, "cursor": cursor})
+            members_data = data["enterprise"]["members"]
+            nodes = members_data["nodes"]
+            members.extend(nodes)
             logger.info("Fetched %d members so far...", len(members))
 
-            # Link-header pagination
-            url = self._next_link(resp)
-            params = None  # params are included in the next URL
+            page_info = members_data["pageInfo"]
+            if not page_info["hasNextPage"]:
+                break
+            cursor = page_info["endCursor"]
 
         logger.info("Total enterprise members: %d", len(members))
         return members
