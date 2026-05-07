@@ -88,9 +88,10 @@ def main() -> int:
         members = client.get_enterprise_members(args.enterprise)
 
         logging.info(
-            "Fetching audit log entries (last %d days)...", args.days
+            "Fetching audit log entries (last %d days) for %d members...", args.days, len(members)
         )
-        actor_last_active = client.get_audit_log(args.enterprise, args.days)
+        member_logins = [m.get("login", "") for m in members if m.get("login")]
+        actor_last_active = client.get_audit_log(args.enterprise, args.days, member_logins=member_logins)
 
         logging.info("Identifying inactive users (threshold: %d days)...", args.days)
         inactive = identify_inactive_users(members, actor_last_active, args.days)

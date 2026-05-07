@@ -147,69 +147,94 @@ class GitHubClient:
         return members
 
     def get_audit_log(
-        self, enterprise: str, since_days: int
+        self, enterprise: str, since_days: int, member_logins: Optional[list[str]] = None
     ) -> dict[str, datetime]:
         """Fetch audit log entries and return the most recent activity per actor.
+
+        When member_logins is provided, queries per-user for efficiency (1 API call
+        per member instead of paginating the entire audit log).
 
         Args:
             enterprise: Enterprise slug.
             since_days: How many days back to query.
+            member_logins: Optional list of specific logins to check.
 
         Returns:
             Dict mapping actor login -> most recent activity datetime.
         """
         since_date = datetime.now(timezone.utc) - timedelta(days=since_days)
-        phrase = f"created:>={since_date.strftime('%Y-%m-%d')}"
+        date_phrase = f"created:>={since_date.strftime('%Y-%m-%d')}"
 
         actor_last_active: dict[str, datetime] = {}
         url = f"{self.base_url}/enterprises/{enterprise}/audit-log"
-        params = {"phrase": phrase, "per_page": DEFAULT_PER_PAGE, "include": "all"}
-        after_cursor: Optional[str] = None
-        page = 0
 
-        while True:
-            if after_cursor:
-                params["after"] = after_cursor
+        if member_logins:
+            # Per-user queries: fetch only 1 entry (most recent) per user
+            for login in member_logins:
+                phrase = f"{date_phrase} actor:{login}"
+                params = {"phrase": phrase, "per_page": 1, "include": "all", "order": "desc"}
+                logger.info("Checking audit log for user '%s'...", login)
 
-            resp = self._request("GET", url, params=params)
-            entries = resp.json()
+                resp = self._request("GET", url, params=params)
+                entries = resp.json()
 
-            if not entries:
-                break
-
-            page += 1
-            for entry in entries:
-                actor = entry.get("actor") or entry.get("user")
-                if not actor:
-                    continue
-
-                ts = entry.get("created_at") or entry.get("@timestamp")
-                if not ts:
-                    continue
-
-                # Parse timestamp (epoch ms or ISO string)
-                if isinstance(ts, (int, float)):
-                    activity_time = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+                if entries:
+                    entry = entries[0]
+                    ts = entry.get("created_at") or entry.get("@timestamp")
+                    if ts:
+                        if isinstance(ts, (int, float)):
+                            activity_time = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+                        else:
+                            activity_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        actor_last_active[login] = activity_time
+                        logger.info("  Last activity: %s", activity_time.strftime("%Y-%m-%d %H:%M:%S UTC"))
+                    else:
+                        logger.info("  No parseable timestamp found")
                 else:
-                    activity_time = datetime.fromisoformat(
-                        ts.replace("Z", "+00:00")
-                    )
+                    logger.info("  No activity in the last %d days", since_days)
+        else:
+            # Full scan: paginate through all audit log entries
+            params = {"phrase": date_phrase, "per_page": DEFAULT_PER_PAGE, "include": "all"}
+            after_cursor: Optional[str] = None
+            page = 0
 
-                existing = actor_last_active.get(actor)
-                if existing is None or activity_time > existing:
-                    actor_last_active[actor] = activity_time
+            while True:
+                if after_cursor:
+                    params["after"] = after_cursor
 
-            logger.info(
-                "Processed audit log page %d (%d entries, %d unique actors so far)",
-                page,
-                len(entries),
-                len(actor_last_active),
-            )
+                resp = self._request("GET", url, params=params)
+                entries = resp.json()
 
-            # Cursor-based pagination: use 'after' from Link header or last entry
-            after_cursor = self._extract_after_cursor(resp)
-            if not after_cursor:
-                break
+                if not entries:
+                    break
+
+                page += 1
+                for entry in entries:
+                    actor = entry.get("actor") or entry.get("user")
+                    if not actor:
+                        continue
+
+                    ts = entry.get("created_at") or entry.get("@timestamp")
+                    if not ts:
+                        continue
+
+                    if isinstance(ts, (int, float)):
+                        activity_time = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+                    else:
+                        activity_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+                    existing = actor_last_active.get(actor)
+                    if existing is None or activity_time > existing:
+                        actor_last_active[actor] = activity_time
+
+                logger.info(
+                    "Processed audit log page %d (%d entries, %d unique actors so far)",
+                    page, len(entries), len(actor_last_active),
+                )
+
+                after_cursor = self._extract_after_cursor(resp)
+                if not after_cursor:
+                    break
 
         logger.info(
             "Audit log scan complete: %d unique actors found", len(actor_last_active)
