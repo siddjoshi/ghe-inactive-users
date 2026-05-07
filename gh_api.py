@@ -62,6 +62,7 @@ class GitHubClient:
         """Make an API request with rate-limit-aware retry and backoff."""
         backoff = INITIAL_BACKOFF
         for attempt in range(MAX_RETRIES):
+            kwargs.setdefault("timeout", 30)
             resp = self.session.request(method, url, **kwargs)
 
             if resp.status_code == 200:
